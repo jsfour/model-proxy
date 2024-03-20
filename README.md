@@ -42,6 +42,20 @@ go run main.go
 
 The server will listen on `http://localhost:8080`.
 
+## Installation
+
+Download the repository and install the dependencies:
+
+```sh
+go get
+```
+
+Then install via:
+
+```sh
+go install
+```
+
 ## Usage
 
 Make an API request to the service with the desired machine learning model name and payload:
