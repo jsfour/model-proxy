@@ -1,4 +1,4 @@
-module model-proxy/proxy
+module github.com/jsfour/model-proxy
 
 go 1.21.7
 
