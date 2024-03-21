@@ -6,157 +6,114 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"sync"
 
-	tiktoken "github.com/pkoukk/tiktoken-go"
+	cache "github.com/jsfour/model-proxy/cache"
+	provider "github.com/jsfour/model-proxy/providers"
 )
 
-type OpenAIProvider struct {
-	endpoint string
-	models   []string
+type sseTransport struct {
+	Transport http.RoundTripper
 }
 
-func parseMessagesContent(req *http.Request) ([]string, error) {
-	var payload struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
-	}
-
-	// Decode the request body into the payload struct
-	bodyBytes, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, err
-	}
-	req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	err = json.Unmarshal(bodyBytes, &payload)
+func (t *sseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Make the actual round trip call using the original transport.
+	resp, err := t.Transport.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
 
-	// Extract the content from each message
-	var contents []string
-	for _, message := range payload.Messages {
-		contents = append(contents, message.Content)
+	// Check if this is an event stream.
+	if req.Header.Get("Accept") == "text/event-stream" {
+		// Make a flushing response writer if needed.
+		flusher, ok := resp.Body.(http.Flusher)
+		if !ok {
+			return nil, io.EOF
+		}
+
+		// Now wrap the response body in our streaming reader.
+		resp.Body = &sseReader{
+			reader:  resp.Body,
+			flusher: flusher,
+		}
 	}
 
-	return contents, nil
+	// Pass the response up the chain.
+	return resp, nil
 }
 
-func (o *OpenAIProvider) GetEndpoint() string {
-	return o.endpoint
+type sseReader struct {
+	reader  io.ReadCloser
+	flusher http.Flusher
+	buffer  bytes.Buffer
 }
 
-func (o *OpenAIProvider) GetModels() []string {
-	return o.models
-}
+func (r *sseReader) Read(p []byte) (n int, err error) {
+	// Read data from the original stream.
+	n, err = r.reader.Read(p)
 
-func (o *OpenAIProvider) CountTokens(req *http.Request, model string) (int, error) {
-	content, err := parseMessagesContent(req)
-	if err != nil {
-		log.Println("Error parsing messages content:", err)
-		return 0, err
+	// If this was a successful read, flush the data.
+	if n > 0 {
+		if flusher, ok := r.flusher.(http.Flusher); ok {
+			flusher.Flush()
+		}
 	}
-
-	// parseMessagesContent extracts the "content" field from each message in the "messages" array.
-	tkm, err := tiktoken.EncodingForModel(model)
-	if err != nil {
-		err = fmt.Errorf("getEncoding: %v", err)
-		return 0, err
-	}
-
-	token := tkm.Encode(strings.Join(content, " "), nil, nil)
-
-	return len(token), nil
+	return n, err
 }
 
-type IModelProvider interface {
-	GetEndpoint() string
-	GetModels() []string
-	CountTokens(req *http.Request, model string) (int, error)
+func (r *sseReader) Close() error {
+	return r.reader.Close()
 }
 
 type ServiceResolver struct {
 	mu        sync.RWMutex
-	providers map[string]IModelProvider
+	providers map[string]provider.IModelProvider
 }
 
 func NewServiceResolver() *ServiceResolver {
 	svc := &ServiceResolver{
-		providers: make(map[string]IModelProvider),
+		providers: make(map[string]provider.IModelProvider),
 	}
 
-	openai := &OpenAIProvider{
-		endpoint: "https://api.openai.com",
-		models: []string{
-			"gpt-3.5-turbo-1106",
-			"text-embedding-3-large",
-			"tts-1-hd-1106",
-			"tts-1-hd",
-			"gpt-4-0314",
-			"gpt-3.5-turbo",
-			"gpt-4-32k-0314",
-			"gpt-3.5-turbo-0125",
-			"gpt-4-0613",
-			"gpt-3.5-turbo-0301",
-			"gpt-3.5-turbo-0613",
-			"gpt-3.5-turbo-instruct-0914",
-			"gpt-3.5-turbo-16k-0613",
-			"gpt-4",
-			"tts-1",
-			"davinci-002",
-			"gpt-4-vision-preview",
-			"gpt-3.5-turbo-instruct",
-			"babbage-002",
-			"tts-1-1106",
-			"gpt-3.5-turbo-16k",
-			"gpt-4-0125-preview",
-			"gpt-4-turbo-preview",
-			"gpt-4-1106-preview",
-			"text-embedding-ada-002",
-			"text-embedding-3-small",
-		},
-	}
+	openai := provider.NewOpenAIProvider()
+
 	svc.Register(openai)
 	return svc
 }
 
 func (r *ServiceResolver) GetReverseProxy(req *http.Request) (*httputil.ReverseProxy, error) {
+	var requestBody struct {
+		Model  string `json:"model,omitempty"`
+		Stream bool   `json:"stream,omitempty"`
+	}
 	var requestBodyBuffer bytes.Buffer
 	tee := io.TeeReader(req.Body, &requestBodyBuffer)
-	decoder := json.NewDecoder(tee)
-	var requestBody map[string]interface{}
-	err := decoder.Decode(&requestBody)
+	err := json.NewDecoder(tee).Decode(&requestBody)
 	if err != nil {
 		return nil, err
 	}
 	req.Body.Close()
 
-	model, ok := requestBody["model"].(string)
 	req.Body = io.NopCloser(&requestBodyBuffer)
 
-	if !ok {
+	if requestBody.Model == "" {
 		return nil, errors.New("Model not specified in the request")
 	}
 
-	provider, found := r.Resolve(model)
+	provider, found := r.Resolve(requestBody.Model)
 	if !found {
 		return nil, errors.New("Service not found for the specified model")
 	}
 
 	targetURL := provider.GetEndpoint()
 
-	log.Println("Targeting model", model, "at", targetURL)
+	log.Println("Targeting model", requestBody.Model, "at", targetURL)
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, err
@@ -169,24 +126,34 @@ func (r *ServiceResolver) GetReverseProxy(req *http.Request) (*httputil.ReverseP
 		req.Host = target.Host
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
-		tokensCount, err := provider.CountTokens(req, model)
+		tokensCount, err := provider.CountTokens(req, requestBody.Model)
 		if err != nil {
 			log.Println("Error counting tokens:", err)
 		}
 		log.Println("Proxying request to", req.URL.String(), "with", tokensCount, "tokens")
 	}
 
+	// if requestBody.Stream {
+	originalTransport := proxy.Transport
+	if originalTransport == nil {
+		originalTransport = http.DefaultTransport
+	}
+	proxy.Transport = &sseTransport{
+		Transport: originalTransport,
+	}
+	// }
+
 	return proxy, nil
 }
 
-func (r *ServiceResolver) Resolve(modelName string) (IModelProvider, bool) {
+func (r *ServiceResolver) Resolve(modelName string) (provider.IModelProvider, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	provider, exists := r.providers[modelName]
 	return provider, exists
 }
 
-func (r *ServiceResolver) Register(provider IModelProvider) {
+func (r *ServiceResolver) Register(provider provider.IModelProvider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, modelName := range provider.GetModels() {
@@ -195,39 +162,14 @@ func (r *ServiceResolver) Register(provider IModelProvider) {
 	}
 }
 
-type ResponseCache struct {
-	mu    sync.RWMutex
-	store map[string][]byte
-}
-
-// Set stores a response in the cache.
-func (c *ResponseCache) Set(key string, value []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.store[key] = value
-}
-
-// Get retrieves a response from the cache.
-func (c *ResponseCache) Get(key string) ([]byte, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	val, exists := c.store[key]
-	return val, exists
-}
-
-// NewResponseCache creates a new ResponseCache.
-func NewResponseCache() *ResponseCache {
-	return &ResponseCache{
-		store: make(map[string][]byte),
-	}
-}
-
 func main() {
-	cache := NewResponseCache()
+	// RunLlama()
+	cache := cache.NewResponseCache()
 
 	resolver := NewServiceResolver()
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		proxy, err := resolver.GetReverseProxy(r)
+
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -240,11 +182,38 @@ func main() {
 			return
 		}
 
-		if val, found := cache.Get(cacheKey); found {
+		if bytesCache, found := cache.Get(cacheKey); found {
 			log.Println("Cache hit")
-			w.Write(val) // Return the cached response
+
+			w.Header().Set("model-proxy-cache", "hit")
+			w.Write(bytesCache) // Return the cached response
 			return
 		}
+
+		if streamCache, found := cache.GetStream(cacheKey); found {
+			log.Println("Cache hit stream")
+			w.Header().Set("model-proxy-cache", "hit")
+
+			// Since we have a streaming response, we will read from the stream's channel
+			for chunk := range streamCache.ReadChunks() {
+				_, writeErr := w.Write(chunk)
+				if writeErr != nil {
+					// If an error occurs while writing to the response writer,
+					// we can log the error and break out of the loop.
+					log.Printf("Error writing chunk to response: %v\n", writeErr)
+					break
+				}
+				// Optional: Flush the response writer if it supports flushing, to send chunks to the client as they're written
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}
+
+			// Once done with the loop, it means the stream has been closed and all chunks are written.
+			return
+		}
+
+		// play back response
 		log.Println("Cache miss")
 
 		// Capture the response
@@ -256,7 +225,7 @@ func main() {
 			w.WriteHeader(rec.Code)
 			log.Println("Returning response")
 			w.Write(responseBody)
-			w.Header().Set("model-proxy-cache", "hit")
+			w.Header().Set("model-proxy-cache", "miss")
 			return
 		}
 
