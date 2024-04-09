@@ -1,4 +1,4 @@
-# Golang Model Proxy Cache Service
+# LLM Model Proxy Cache
 ### Develop against large language models without the big bill
 
 This application serves as a reverse proxy with caching capabilities, specifically tailored for language model model API requests. Built with Golang, it facilitates interactions with models hosted on platforms like OpenAI by caching responses and minimizing redundant external API calls.
