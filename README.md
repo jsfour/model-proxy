@@ -6,6 +6,9 @@ This application serves as a reverse proxy with caching capabilities, specifical
 
 The goal is to allow for you to develop against llm api's without running up a bill.
 
+This proxy cache service significantly enhances agent workflows by reducing latency and costs associated with repeated API calls. When developing and testing AI agents that interact with language models, many requests are often similar or identical. By caching responses, this service allows agents to quickly retrieve previously generated content, speeding up development cycles and reducing API usage. This is particularly beneficial for iterative testing, debugging, and fine-tuning of agent behaviors, enabling developers to create more efficient and cost-effective AI-powered applications.
+
+
 ## Features
 
 - **Reverse Proxy Functionality:** Directs API requests to the appropriate machine learning model service provider. **Currently only supports OpenAI.**
