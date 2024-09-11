@@ -77,6 +77,16 @@ func NewOpenAIProvider() *OpenAIProvider {
 	return &OpenAIProvider{
 		endpoint: "https://api.openai.com",
 		models: []string{
+			"gpt-4o",
+			"gpt-4o-2024-05-13",
+			"gpt-4o-2024-08-06",
+			"chatgpt-4o-latest",
+			"gpt-4-turbo",
+			"gpt-4-turbo-2024-04-09",
+			"gpt-4-0125-preview",
+			"gpt-4-1106-preview",
+			"gpt-4-0613",
+			"gpt-4-0314",
 			"gpt-3.5-turbo-1106",
 			"text-embedding-3-large",
 			"tts-1-hd-1106",

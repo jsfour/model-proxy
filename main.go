@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"sync"
 
+	"github.com/andybalholm/brotli"
 	cache "github.com/jsfour/model-proxy/cache"
 	provider "github.com/jsfour/model-proxy/providers"
 )
@@ -182,11 +183,30 @@ func main() {
 			return
 		}
 
-		if bytesCache, found := cache.Get(cacheKey); found {
-			log.Println("Cache hit")
+		if cacheEntry, found := cache.Get(cacheKey); found {
+			log.Printf("Cache hit: %d bytes", len(cacheEntry.Body))
 
 			w.Header().Set("model-proxy-cache", "hit")
-			w.Write(bytesCache) // Return the cached response
+
+			// Decompress Brotli-encoded content
+			reader := brotli.NewReader(bytes.NewReader(cacheEntry.Body))
+			decompressed, err := io.ReadAll(reader)
+			if err != nil {
+				log.Printf("Error decompressing Brotli content: %v", err)
+				// Handle error appropriately
+			} else {
+				log.Printf("Decompressed cache content: %s", string(decompressed))
+			}
+
+			// Write the original (compressed) content to the response
+			// Set cached headers from cacheEntry.headers
+			for key, values := range cacheEntry.Headers {
+				for _, value := range values {
+					w.Header().Add(key, value)
+				}
+			}
+
+			w.Write(cacheEntry.Body)
 			return
 		}
 
@@ -222,17 +242,28 @@ func main() {
 
 		responseBody, err := io.ReadAll(rec.Body)
 		if err != nil {
-			w.WriteHeader(rec.Code)
-			log.Println("Returning response")
-			w.Write(responseBody)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "br")
 			w.Header().Set("model-proxy-cache", "miss")
+			w.WriteHeader(rec.Code)
+			log.Println("Error reading response returning response")
+			log.Println(err)
+			w.Write(responseBody)
 			return
 		}
 
 		// Cache the response if the status code indicates success
 		if rec.Code >= 200 && rec.Code < 300 {
-			log.Println("Caching response")
-			cache.Set(cacheKey, responseBody)
+			log.Printf("Caching response of size %d bytes", len(responseBody))
+			// Create headers with application type and content encoding if they exist
+			headers := http.Header{}
+			if contentType := rec.Header().Get("Content-Type"); contentType != "" {
+				headers.Set("Content-Type", contentType)
+			}
+			if contentEncoding := rec.Header().Get("Content-Encoding"); contentEncoding != "" {
+				headers.Set("Content-Encoding", contentEncoding)
+			}
+			cache.Set(cacheKey, responseBody, headers)
 		}
 
 		// Copy the captured response to the actual response
