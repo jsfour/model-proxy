@@ -61,8 +61,15 @@ func (o *OpenAIProvider) CountTokens(req *http.Request, model string) (int, erro
 		return 0, err
 	}
 
-	// parseMessagesContent extracts the "content" field from each message in the "messages" array.
 	tkm, err := tiktoken.EncodingForModel(model)
+	if err != nil {
+		// If there's no encoding for the specific model, fallback to gpt-4 encoder
+		tkm, err = tiktoken.EncodingForModel("gpt-4")
+		if err != nil {
+			return 0, fmt.Errorf("failed to get encoding: %v", err)
+		}
+	}
+
 	if err != nil {
 		err = fmt.Errorf("getEncoding: %v", err)
 		return 0, err
